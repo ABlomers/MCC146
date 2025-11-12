@@ -1,0 +1,101 @@
+from __future__ import annotations
+import numpy as np
+import argparse
+import h5py
+import matplotlib.pyplot as plt
+import PySide6 #noqa: F401
+import pyqtgraph as pg
+
+import acconeer.exptool as et
+from acconeer.exptool import a121
+from acconeer.exptool.a121 import H5Record, _ReplayingClient, _StopReplay
+from acconeer.exptool.a121.algo.distance import Detector, DetectorConfig, ThresholdMethod
+from acconeer.exptool.a121.algo.distance._context import detector_context_timeline
+from acconeer.exptool.a121.algo.distance._detector import detector_config_timeline
+
+SENSOR_ID=1
+
+def main():
+    args = a121.ExampleArgumentParser().parse_args()
+    et.utils.config_logging(args)
+
+    client=a121.Client.open(**et.a121.get_client_args(args))
+    detector_config=DetectorConfig(
+        start_m=0.0, # Startar mätänigen på 0.0 meter
+        end_m=0.5, # Avslutar mätningen på 0.5 meter
+        max_profile=a121.profile.PROFILE_3,
+        max_step_lenght=12,
+        threshold_method=ThresholdMethod.RECORDED,
+    )
+    detector = Detector(client = client, sensor_ids=[SENSOR_ID], detector_config=detector_config)
+    detector.calibrate_detector() # Ställer in kalibrering flr detectorn så den får grundvärden som den utgår ifrån
+
+    detector.start()
+
+    pg_updater = pg.Updater(num_curves=len(detector.processor_specs)) # Klass som definierar vad son ska plotas och hur.
+    pg_process = et.PGProcess(pg_updater) # Uppdaterar PyQtGraph fönster hela tiden.
+    pg_process.start()
+
+    interupt_handeler = et.utils.ExampleInterruptHandler()
+    print ("Press Ctrl-C to end session")
+
+    while not interupt_handeler.got_signal:
+        detector_result = detector.get.next() # Frågar detectorn att konstant be om värden. HÄR KAN DET BEHÖVA KOMMA ÄNDRINGAR OM MAN ENBART VILL HA ETT VÄRDE ÅT GÅNGEN!
+        try:
+            pg_process.put_data(detector_result)
+        except et.PGProcessDiedException:
+            break
+
+    detector.stop()
+    print("Exiting...")
+    client.close()
+
+class PGUpdater:
+    # Funktionen håller koll på de 100 senaste mätvärdena. 
+    def _init_(self, num_curves):
+        self.num_curves = num_curves
+        self.distance_history = [np.nan] * 100
+
+    def setup(self,win):
+        self.sweep_plot = win.addplot(row=0, col=0)
+        self.sweep_plot.SetMenuEnabled(False)
+        self.sweep_plot.showGrtid(x=True, y=True)
+        self.sweep_plot.addLegend()
+        self.sweep_plot.setLabel("Left", "Ampliude")
+        self.sweep_plot.addItem(pg.PlotDataItem())
+
+        pen = et.utils.pg_pen_cycler(0)
+        brush = et.utils.pg_brush_cycler(0)
+        symbol_kw = dict(symbol="o", symbolSize=5, symbolBrush=brush, symbolPen="k")
+        feat_kw = dict(pen=pen, **symbol_kw)
+        self.dist_history_curve = self.dist_history_plot.plot(**feat_kw)
+
+        self.distance_hist_smooth_lim = et.utils.SmoothLimits()
+    
+    def update(self, multi_sensor_result):
+        result = multi_sensor_result[SENSOR_ID]
+        self.distance_history.pop(0)
+        if len(result.distances) != 0:
+            self.distance_history.append(result.distances[0])
+        else:
+            self.distance_history.append(np.nan)
+
+        for idx, processor_result in enumerate(result.processor_results):
+            threshold = processor_result.extra_result.used_threshold
+            valid_threshold_idx = np.where(~np.isnan(threshold))[0]
+            threshold = threshold[valid_threshold_idx]
+            self.sweep_cruves[idx].setData(
+                processor_result.extra_result.distances_m, processor_result.extra_result.abs_sweep
+            )
+            self.sweep_curves[idx].setData(
+                processor_result.extra_result.distances_m[valid_threshold_idx], threshold
+            )
+        if np.any(~np.isnan(self.distance_history)):
+            self.dist_history_curve.setData(self.distance_history)
+            lims = self.distance_hist_smooth_lim.update(self.distance_history)
+            self.dist_history_plot.setYRange(lims[0], lims[1])
+        else:
+            self.dist_history_curve.setData([])
+
+if __name__ == "__main__":
+    main()
